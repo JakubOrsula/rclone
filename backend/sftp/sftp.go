@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"math/rand"
 	"net/url"
 	"os"
 	"path"
@@ -35,6 +36,12 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
+
+// SftpHLinkInfo holds hardlink information for SFTP files
+type SftpHLinkInfo struct {
+	dev uint64 // device number
+	ino uint64 // inode number
+}
 
 const (
 	defaultShellType        = "unix"
@@ -511,6 +518,11 @@ as the source and the destination will be the same file.
 
 This feature may be useful backups made with --copy-dest.`,
 			Advanced: true,
+		}, {
+			Name:     "preserve_hlinks",
+			Default:  false,
+			Help:     "Preserve hard links when syncing.",
+			Advanced: true,
 		}},
 	}
 	fs.Register(fsi)
@@ -556,42 +568,46 @@ type Options struct {
 	SocksProxy              string          `config:"socks_proxy"`
 	HTTPProxy               string          `config:"http_proxy"`
 	CopyIsHardlink          bool            `config:"copy_is_hardlink"`
+	PreserveHLinks          bool            `config:"preserve_hlinks"`
 }
 
 // Fs stores the interface to the remote SFTP files
 type Fs struct {
-	name         string
-	root         string
-	absRoot      string
-	shellRoot    string
-	shellType    string
-	opt          Options          // parsed options
-	ci           *fs.ConfigInfo   // global config
-	m            configmap.Mapper // config
-	features     *fs.Features     // optional features
-	config       *ssh.ClientConfig
-	url          string
-	mkdirLock    *stringLock
-	cachedHashes *hash.Set
-	poolMu       sync.Mutex
-	pool         []*conn
-	drain        *time.Timer // used to drain the pool when we stop using the connections
-	pacer        *fs.Pacer   // pacer for operations
-	savedpswd    string
-	sessions     atomic.Int32 // count in use sessions
-	tokens       *pacer.TokenDispenser
-	proxyURL     *url.URL // address of HTTP proxy read from environment
+	name                        string
+	root                        string
+	absRoot                     string
+	shellRoot                   string
+	shellType                   string
+	opt                         Options          // parsed options
+	ci                          *fs.ConfigInfo   // global config
+	m                           configmap.Mapper // config
+	features                    *fs.Features     // optional features
+	config                      *ssh.ClientConfig
+	url                         string
+	mkdirLock                   *stringLock
+	cachedHashes                *hash.Set
+	poolMu                      sync.Mutex
+	pool                        []*conn
+	drain                       *time.Timer // used to drain the pool when we stop using the connections
+	pacer                       *fs.Pacer   // pacer for operations
+	savedpswd                   string
+	sessions                    atomic.Int32 // count in use sessions
+	tokens                      *pacer.TokenDispenser
+	proxyURL                    *url.URL // address of HTTP proxy read from environment
+	hlTracker                   fs.HLinkTracker
+	noArbitraryCommandExecution bool
 }
 
 // Object is a remote SFTP file that has been stat'd (so it exists, but is not necessarily open for reading)
 type Object struct {
-	fs      *Fs
-	remote  string
-	size    int64       // size of the object
-	modTime uint32      // modification time of the object as unix time
-	mode    os.FileMode // mode bits from the file
-	md5sum  *string     // Cached MD5 checksum
-	sha1sum *string     // Cached SHA1 checksum
+	fs        *Fs
+	remote    string
+	size      int64       // size of the object
+	modTime   uint32      // modification time of the object as unix time
+	mode      os.FileMode // mode bits from the file
+	md5sum    *string     // Cached MD5 checksum
+	sha1sum   *string     // Cached SHA1 checksum
+	hlinkInfo any         // hardlink info (device and inode)
 }
 
 // conn encapsulates an ssh client and corresponding sftp client
@@ -1173,7 +1189,8 @@ func NewFsWithConnection(ctx context.Context, f *Fs, name string, root string, m
 			_ = session.Close()
 			f.shellType = defaultShellType
 			if err != nil {
-				fs.Debugf(f, "Remote command failed: %v (stdout=%v) (stderr=%v)", err, bytes.TrimSpace(stdout.Bytes()), bytes.TrimSpace(stderr.Bytes()))
+				f.shellType = shellTypeNotSupported
+				fs.Debugf(f, "Remote command failed: %s (stdout=%s) (stderr=%s)", err, bytes.TrimSpace(stdout.Bytes()), bytes.TrimSpace(stderr.Bytes()))
 			} else {
 				outBytes := stdout.Bytes()
 				fs.Debugf(f, "Remote command result: %s", outBytes)
@@ -1267,6 +1284,71 @@ func (f *Fs) String() string {
 // Features returns the optional features of this Fs
 func (f *Fs) Features() *fs.Features {
 	return f.features
+}
+
+// ShouldPreserveLinks returns whether hardlinks should be preserved
+func (f *Fs) ShouldPreserveLinks() bool {
+	return f.opt.PreserveHLinks
+}
+
+// HLink creates a hardlink from oldPath to newPath
+func (f *Fs) HLink(ctx context.Context, oldPath, newPath string) error {
+	err := f.mkParentDir(ctx, newPath)
+	if err != nil {
+		fs.Errorf(f, "Create for hlink mkParentDir failed: %v", err)
+		return fmt.Errorf("create for hlink mkParentDir failed: %w", err)
+	}
+
+	c, err := f.getSftpConnection(ctx)
+	if err != nil {
+		fs.Errorf(f, "Could not get sftp connection: %v", err)
+		return fmt.Errorf("could not get sftp connection: %w", err)
+	}
+	err = c.sftpClient.Link(path.Join(f.absRoot, oldPath), path.Join(f.absRoot, newPath))
+	f.putSftpConnection(&c, err)
+	if err != nil {
+		if sftpErr, ok := err.(*sftp.StatusError); ok {
+			if sftpErr.FxCode() == sftp.ErrSSHFxOpUnsupported {
+				// Remote doesn't support Link
+				fs.Errorf(f, "SFTP hardlink extension operation not supported")
+				return fmt.Errorf("SFTP hardlink extension operation not supported")
+			}
+		}
+		fs.Errorf(f, "Hardlink from %s to %s failed: %v", oldPath, newPath, err)
+		return fmt.Errorf("Hardlink failed: %w", err)
+	}
+
+	return nil
+}
+
+// HLinkID returns the hardlink ID of the file
+func (f *Fs) HLinkID(ctx context.Context, tgt fs.Object) (any, bool) {
+	obj, isObj := tgt.(*Object)
+	if !isObj {
+		fs.Debugf(f, "%v is not a *sftp.Object", tgt)
+		return nil, false
+	}
+
+	// Get hardlink info if not already cached
+	if obj.hlinkInfo == nil {
+		err := obj.getHLinkInfo(ctx)
+		if err != nil {
+			fs.Debugf(f, "failed to get hardlink info for %q: %v", obj.remote, err)
+			return nil, false
+		}
+	}
+
+	return obj.hlinkInfo, obj.hlinkInfo != nil
+}
+
+// RegisterLinkRoot registers a hardlink root for tracking
+func (f *Fs) RegisterLinkRoot(ctx context.Context, src fs.Object, fsrc fs.Hardlinker, dst fs.Object, dstPath string, willTransfer bool) (bool, error) {
+	return f.hlTracker.RegisterHLinkRoot(ctx, src, fsrc, dst, f, dstPath, willTransfer)
+}
+
+// NotifyLinkRootTransferComplete notifies that a hardlink root transfer is complete
+func (f *Fs) NotifyLinkRootTransferComplete(ctx context.Context, src fs.Object, fsrc fs.Hardlinker, dst fs.Object) error {
+	return f.hlTracker.FlushLinkrootLinkQueue(ctx, src, fsrc, dst, f)
 }
 
 // Precision is the remote sftp file system's modtime precision, which we have no way of knowing. We estimate at 1s
@@ -1628,7 +1710,7 @@ func (f *Fs) run(ctx context.Context, cmd string) ([]byte, error) {
 	fs.Debugf(f, "Running remote command: %s", cmd)
 	err = session.Run(cmd)
 	if err != nil {
-		return nil, fmt.Errorf("failed to run %q: %s: %w", cmd, bytes.TrimSpace(stderr.Bytes()), err)
+		return nil, fmt.Errorf("failed to run %q: :%s %s: %w", cmd, bytes.TrimSpace(stdout.Bytes()), bytes.TrimSpace(stderr.Bytes()), err)
 	}
 	fs.Debugf(f, "Remote command result: %s", bytes.TrimSpace(stdout.Bytes()))
 
@@ -1851,6 +1933,67 @@ func (o *Object) String() string {
 // Remote the name of the remote SFTP file, relative to the fs root
 func (o *Object) Remote() string {
 	return o.remote
+}
+
+// getHLinkInfo gets the hardlink information for this object
+func (o *Object) getHLinkInfo(ctx context.Context) error {
+	fs.Debug("", "SHELL TYPE: "+o.fs.opt.ShellType+" "+o.fs.shellType)
+	if o.fs.shellType == shellTypeNotSupported {
+		o.hlinkInfo = SftpHLinkInfo{
+			dev: rand.Uint64(),
+			ino: rand.Uint64(),
+		}
+		return nil
+	}
+	shellPath := o.fs.remoteShellPath(o.remote)
+	escapedPath, err := o.fs.quoteOrEscapeShellPath(shellPath)
+	if err != nil {
+		return fmt.Errorf("failed to escape path %q: %w", o.remote, err)
+	}
+
+	// Use stat to get device and inode numbers
+	// Format: device inode  (we only need these two fields)
+	cmd := fmt.Sprintf("stat -c '%%d %%i' %s", escapedPath)
+	output, err := o.fs.run(ctx, cmd)
+	if err != nil {
+		fs.Error(err, "This ssh connection is for sftp only, "+
+			"can't get inode information of file on sftp."+
+			"Hardlink structure will be preserved for uploading, please add the "+
+			"You can download the remote structure without --local-preserve-hlinks option")
+		o.hlinkInfo = SftpHLinkInfo{
+			dev: rand.Uint64(),
+			ino: rand.Uint64(),
+		}
+		return nil
+	}
+
+	// Parse the output: "device inode"
+	parts := strings.Fields(strings.TrimSpace(string(output)))
+	if len(parts) != 2 {
+		return fmt.Errorf("unexpected stat output format: %q", string(output))
+	}
+
+	dev, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse device number %q: %w", parts[0], err)
+	}
+
+	ino, err := strconv.ParseUint(parts[1], 10, 64)
+	if err != nil {
+		return fmt.Errorf("failed to parse inode number %q: %w", parts[1], err)
+	}
+
+	o.hlinkInfo = SftpHLinkInfo{
+		dev: dev,
+		ino: ino,
+	}
+
+	return nil
+}
+
+// HLinkInfo returns the hardlink information for this object
+func (o *Object) HLinkInfo() (any, bool) {
+	return o.hlinkInfo, o.hlinkInfo != nil
 }
 
 // Hash returns the selected checksum of the file

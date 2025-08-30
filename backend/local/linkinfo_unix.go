@@ -3,9 +3,10 @@
 package local
 
 import (
-	"github.com/rclone/rclone/fs"
 	"os"
 	"syscall"
+
+	"github.com/rclone/rclone/fs"
 )
 
 // https://cs.opensource.google/go/go/+/master:src/os/types_unix.go
@@ -23,7 +24,7 @@ func getHLinkInfo(path string, info os.FileInfo) any {
 	}
 
 	return UnixHLinkInfo{
-		dev: st.Dev,
+		dev: uint64(st.Dev),
 		ino: st.Ino,
 	}
 }
